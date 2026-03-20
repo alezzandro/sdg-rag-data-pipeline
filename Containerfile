@@ -8,7 +8,10 @@ RUN mkdir -p /tmp /var/tmp && chmod 1777 /tmp /var/tmp
 RUN dnf install -y git gcc python3.12-devel && \
     dnf clean all
 
+# The base image pins pip to the Red Hat package index which lacks some
+# packages (e.g. faiss-cpu).  Add PyPI as a fallback.
 RUN pip3.12 install --no-cache-dir \
+        --extra-index-url https://pypi.org/simple/ \
         sdg-hub \
         sentence-transformers \
         faiss-cpu \
