@@ -21,6 +21,9 @@ RUN pip3.12 install --no-cache-dir \
 WORKDIR /workspace
 COPY . /workspace
 
+# Make workspace writable by the non-root user (uid 1001, gid 0)
+RUN chown -R 1001:0 /workspace && chmod -R g+rwX /workspace
+
 # Reset to the default non-root user
 USER 1001
 
