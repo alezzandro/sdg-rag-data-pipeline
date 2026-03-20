@@ -205,3 +205,13 @@ cython_debug/
 marimo/_static/
 marimo/_lsp/
 __marimo__/
+
+# custom
+example-projects/
+
+# RAG pipeline artifacts
+knowledge/
+vectorstore/
+*.log
+*.pid
+evaluation_results.csv
