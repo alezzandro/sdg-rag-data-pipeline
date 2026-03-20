@@ -1,23 +1,26 @@
-FROM registry.access.redhat.com/ubi9/ubi
+FROM registry.redhat.io/rhaiis/vllm-cuda-rhel9:3.3.0
 
-RUN dnf install -y git gcc python3.12 python3.12-pip python3.12-devel libxcb mesa-libGL && \
+USER 0
+
+# The vLLM image is missing /tmp; dill (torch dep) crashes without it.
+RUN mkdir -p /tmp /var/tmp && chmod 1777 /tmp /var/tmp
+
+RUN dnf install -y git gcc python3.12-devel && \
     dnf clean all
 
-WORKDIR /workspace
-
-RUN python3.12 -m venv /opt/venv
-ENV PATH="/opt/venv/bin:$PATH"
-
-RUN pip3.12 install --no-cache-dir --upgrade pip && \
-    pip3.12 install --no-cache-dir \
+RUN pip3.12 install --no-cache-dir \
         sdg-hub \
         sentence-transformers \
         faiss-cpu \
         rouge-score \
         openai
 
-# vllm needs CUDA at install time (CDI not available during podman build).
-# Install it once inside the running container:
-#   pip3.12 install vllm
-
+WORKDIR /workspace
 COPY . /workspace
+
+# Reset to the default non-root user
+USER 1001
+
+# Override the vLLM entrypoint so the container can run arbitrary commands
+ENTRYPOINT []
+CMD ["sleep", "infinity"]

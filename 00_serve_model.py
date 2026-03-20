@@ -182,15 +182,27 @@ def main():
               file=sys.stderr)
         sys.exit(1)
 
-    # Verify vllm is installed
-    if not shutil.which("vllm"):
-        print("ERROR: 'vllm' command not found. Install with: pip install vllm",
-              file=sys.stderr)
-        sys.exit(1)
+    # Verify vllm is installed (CLI binary or Python module)
+    use_vllm_cli = bool(shutil.which("vllm"))
+    if not use_vllm_cli:
+        try:
+            subprocess.check_call(
+                [sys.executable, "-c", "import vllm"],
+                stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+            )
+        except (subprocess.CalledProcessError, FileNotFoundError):
+            print("ERROR: vLLM not found. Install with: pip install vllm",
+                  file=sys.stderr)
+            sys.exit(1)
 
     # Build the vllm serve command
-    cmd = [
-        "vllm", "serve", model,
+    if use_vllm_cli:
+        cmd = ["vllm", "serve", model]
+    else:
+        cmd = [sys.executable, "-m", "vllm.entrypoints.openai.api_server",
+               "--model", model]
+
+    cmd += [
         "--port", str(args.port),
         "--max-model-len", str(args.max_model_len),
         "--gpu-memory-utilization", str(args.gpu_memory_utilization),

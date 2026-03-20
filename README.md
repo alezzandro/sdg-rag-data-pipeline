@@ -54,8 +54,10 @@ or RHEL AI system with an NVIDIA GPU and `podman`.
 ## Host Setup
 
 RHEL AI ships with Python 3.9 on the host, which is too old for this
-pipeline. Everything runs inside a **UBI9** container with Python 3.12,
-using podman to pass through the NVIDIA GPU.
+pipeline. Everything runs inside a container based on the **RHEL AI
+vLLM image** (`registry.redhat.io/rhaiis/vllm-cuda-rhel9:3.3.0`) which
+includes Python 3.12, vLLM, PyTorch, and CUDA — using podman to pass
+through the NVIDIA GPU.
 
 ### 1. Enable user lingering (required for remote sessions)
 
@@ -73,7 +75,15 @@ be stopped when you log out.
 > If podman shows errors like `"invalid internal status"` after a
 > disconnect, run `podman system migrate` to reset.
 
-### 2. Build the container image
+### 2. Log in to the Red Hat registry and build the container image
+
+The base image requires Red Hat registry authentication:
+
+```bash
+podman login registry.redhat.io
+```
+
+Then clone and build:
 
 ```bash
 git clone <this-repo-url>
@@ -81,9 +91,10 @@ cd sdg-rag-data-pipeline
 podman build -t sdg-rag-pipeline .
 ```
 
-The `Containerfile` installs Python 3.12, system libraries, and all pip
-dependencies except vLLM (which requires CUDA at install time and must
-be installed inside the running container).
+The `Containerfile` is based on the RHEL AI vLLM image which already
+includes vLLM, PyTorch, and CUDA. The build adds the RAG pipeline
+dependencies (SDG Hub, sentence-transformers, FAISS, etc.) and fixes
+the missing `/tmp` directory in the base image.
 
 ### 3. Create and start the container
 
@@ -122,13 +133,7 @@ background processes inside it keep running.
 
 ### 5. First-time setup inside the container
 
-Install vLLM (requires GPU access, so it cannot be done at build time):
-
-```bash
-pip3.12 install vllm
-```
-
-Clone the repository inside the container:
+vLLM is already installed from the base image. Clone the repository:
 
 ```bash
 cd /workspace
