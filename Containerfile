@@ -18,6 +18,11 @@ RUN pip3.12 install --no-cache-dir \
         rouge-score \
         openai
 
+# The base image sets HF offline mode; allow model downloads.
+ENV HF_HUB_OFFLINE=0
+ENV TRANSFORMERS_OFFLINE=0
+ENV HF_HOME=/root/.cache/huggingface
+
 WORKDIR /workspace
 COPY . /workspace
 
