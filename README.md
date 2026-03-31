@@ -98,21 +98,24 @@ the missing `/tmp` directory in the base image.
 
 ### 3. Create and start the container
 
-Create a persistent, detached container with GPU access and a named
-volume for the Hugging Face model cache:
+Create a persistent, detached container with GPU access. The cloned
+repository is bind-mounted into the container so that all generated
+artifacts (knowledge, vector store, logs) are written to the host
+filesystem and survive container rebuilds:
 
 ```bash
 podman run -d --name sdg-rag-container \
   --device nvidia.com/gpu=all \
   --security-opt=label=disable \
   -v hf-cache:/root/.cache/huggingface \
-  sdg-rag-pipeline \
-  sleep infinity
+  -v $(pwd):/workspace:Z \
+  sdg-rag-pipeline
 ```
 
 The container runs `sleep infinity` as PID 1, so it stays alive even
 when you disconnect your exec session. The `hf-cache` volume persists
-downloaded model weights across container restarts.
+downloaded model weights and the bind mount persists all pipeline
+output across container restarts and rebuilds.
 
 | Flag | Purpose |
 |------|---------|
@@ -121,6 +124,7 @@ downloaded model weights across container restarts.
 | `--device nvidia.com/gpu=all` | CDI GPU passthrough |
 | `--security-opt=label=disable` | Prevent SELinux from blocking GPU access |
 | `-v hf-cache:/root/.cache/huggingface` | Persist model downloads |
+| `-v $(pwd):/workspace:Z` | Bind-mount the repo into the container; `:Z` relabels for SELinux |
 
 ### 4. Connect to the container
 
@@ -129,17 +133,9 @@ podman exec -it sdg-rag-container /bin/bash
 ```
 
 You can disconnect and reconnect at any time — the container and all
-background processes inside it keep running.
-
-### 5. First-time setup inside the container
-
-vLLM is already installed from the base image. Clone the repository:
-
-```bash
-cd /workspace
-git clone <this-repo-url>
-cd sdg-rag-data-pipeline
-```
+background processes inside it keep running. All files under
+`/workspace` are on the host, so nothing is lost if the container
+exits or is rebuilt.
 
 ## Quick Start
 
