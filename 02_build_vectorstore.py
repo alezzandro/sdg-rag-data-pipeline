@@ -1,19 +1,28 @@
-"""Build a FAISS vector store from seed documents and SDG-generated QA pairs.
+"""Build a FAISS + BM25 hybrid vector store from seed documents and SDG QA pairs.
 
 Reads the artifacts produced by 01_extract_knowledge.py (seed_docs.json and
-knowledge.csv), chunks and embeds them with sentence-transformers, and
-persists a FAISS index alongside metadata for retrieval.
+knowledge.csv), chunks and embeds them with sentence-transformers, builds a
+FAISS index for dense retrieval, and a BM25 index for sparse retrieval.
+
+The hybrid store is used by 03_query_rag.py and 04_evaluate_rag.py with
+reciprocal rank fusion (RRF) to combine dense and sparse scores.
 """
 
 import os
 import re
 import json
+import pickle
 import argparse
 
 import numpy as np
 import pandas as pd
 import faiss
 from sentence_transformers import SentenceTransformer
+
+try:
+    from rank_bm25 import BM25Okapi
+except ImportError:
+    BM25Okapi = None
 
 
 def _split_oversized(text, max_chars):
@@ -38,7 +47,7 @@ def _split_oversized(text, max_chars):
     return chunks
 
 
-def chunk_text(text, max_chars=2500):
+def chunk_text(text, max_chars=2000):
     """Split markdown text into chunks by heading boundaries."""
     sections = re.split(r"(?=^#{1,3} )", text, flags=re.MULTILINE)
     chunks, current_chunk = [], ""
@@ -60,21 +69,40 @@ def chunk_text(text, max_chars=2500):
     return [c for c in chunks if c]
 
 
+def contextualize_chunk(chunk_text, subtopic="", source=""):
+    """Prepend context header to make each chunk self-contained."""
+    parts = []
+    if subtopic:
+        parts.append(f"Topic: {subtopic}")
+    if source:
+        parts.append(f"Source: {source}")
+    if parts:
+        return "\n".join(parts) + "\n\n" + chunk_text
+    return chunk_text
+
+
+def tokenize_for_bm25(text):
+    """Simple whitespace + punctuation tokenizer for BM25."""
+    return re.findall(r"\w+", text.lower())
+
+
 def main():
     parser = argparse.ArgumentParser(
-        description="Build a FAISS vector store from seed docs and SDG QA pairs."
+        description="Build a FAISS + BM25 hybrid vector store from seed docs and SDG QA pairs."
     )
     parser.add_argument("--knowledge-dir", type=str, default="./knowledge",
                         help="Directory containing seed_docs.json and knowledge.csv (default: ./knowledge)")
     parser.add_argument("--output", type=str, default="./vectorstore",
                         help="Output directory for the vector store (default: ./vectorstore)")
     parser.add_argument("--embedding-model", type=str,
-                        default="sentence-transformers/all-MiniLM-L6-v2",
-                        help="Sentence-transformers model for embeddings (default: all-MiniLM-L6-v2)")
-    parser.add_argument("--max-chunk-chars", type=int, default=2500,
-                        help="Max characters per chunk for seed docs (default: 2500)")
+                        default="BAAI/bge-base-en-v1.5",
+                        help="Sentence-transformers model for embeddings (default: BAAI/bge-base-en-v1.5)")
+    parser.add_argument("--max-chunk-chars", type=int, default=2000,
+                        help="Max characters per chunk for seed docs (default: 2000)")
     parser.add_argument("--batch-size", type=int, default=64,
                         help="Embedding batch size (default: 64)")
+    parser.add_argument("--no-bm25", action="store_true",
+                        help="Skip BM25 index creation (dense-only mode)")
     args = parser.parse_args()
 
     seed_docs_path = os.path.join(args.knowledge_dir, "seed_docs.json")
@@ -88,12 +116,15 @@ def main():
             seed_docs = json.load(f)
         print(f"Loaded {len(seed_docs)} seed documents from {seed_docs_path}")
         for doc in seed_docs:
+            subtopic = doc.get("subtopic", "")
             chunks = chunk_text(doc["content"], max_chars=args.max_chunk_chars)
             for chunk in chunks:
+                ctx_text = contextualize_chunk(chunk, subtopic=subtopic, source="reference document")
                 documents.append({
-                    "text": chunk,
+                    "text": ctx_text,
+                    "text_raw": chunk,
                     "source": "seed_doc",
-                    "subtopic": doc.get("subtopic", ""),
+                    "subtopic": subtopic,
                 })
         print(f"  Chunked into {len(documents)} text segments")
     else:
@@ -112,8 +143,10 @@ def main():
                 q = str(row[q_col]).strip()
                 a = str(row[r_col]).strip()
                 if q and a and q != "nan" and a != "nan":
+                    qa_text = f"Q: {q}\nA: {a}"
                     documents.append({
-                        "text": f"Q: {q}\nA: {a}",
+                        "text": qa_text,
+                        "text_raw": qa_text,
                         "source": "sdg_qa",
                         "subtopic": "",
                     })
@@ -162,7 +195,20 @@ def main():
     index.add(embeddings)
     print(f"  Index contains {index.ntotal} vectors")
 
-    # --- 5. Save to disk ---
+    # --- 5. Build BM25 index ---
+    bm25_built = False
+    if not args.no_bm25:
+        if BM25Okapi is None:
+            print("WARNING: rank_bm25 not installed, skipping BM25 index. "
+                  "Install with: pip install rank_bm25")
+        else:
+            print("Building BM25 index for hybrid retrieval...")
+            tokenized_corpus = [tokenize_for_bm25(doc["text"]) for doc in documents]
+            bm25 = BM25Okapi(tokenized_corpus)
+            bm25_built = True
+            print(f"  BM25 index built over {len(tokenized_corpus)} documents")
+
+    # --- 6. Save to disk ---
     os.makedirs(args.output, exist_ok=True)
 
     index_path = os.path.join(args.output, "index.faiss")
@@ -176,20 +222,37 @@ def main():
     with open(metadata_path, "w") as f:
         json.dump(metadata, f)
 
+    # Detect query instruction for BGE-family models
+    query_instruction = ""
+    model_name_lower = args.embedding_model.lower()
+    if "bge-" in model_name_lower and "v1.5" in model_name_lower:
+        query_instruction = "Represent this sentence for searching relevant passages: "
+
     config = {
         "embedding_model": args.embedding_model,
         "dimension": dimension,
         "num_vectors": index.ntotal,
         "max_chunk_chars": args.max_chunk_chars,
+        "query_instruction": query_instruction,
+        "has_bm25": bm25_built,
     }
     config_path = os.path.join(args.output, "config.json")
     with open(config_path, "w") as f:
         json.dump(config, f, indent=2)
 
+    if bm25_built:
+        bm25_path = os.path.join(args.output, "bm25.pkl")
+        with open(bm25_path, "wb") as f:
+            pickle.dump(bm25, f)
+
     print(f"\nVector store saved to {args.output}/")
     print(f"  {index_path}    ({index.ntotal} vectors, {dimension}d)")
     print(f"  {metadata_path}")
     print(f"  {config_path}")
+    if bm25_built:
+        print(f"  {os.path.join(args.output, 'bm25.pkl')}")
+    if query_instruction:
+        print(f"  Query instruction: \"{query_instruction}\"")
 
 
 if __name__ == "__main__":

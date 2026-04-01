@@ -13,9 +13,9 @@ answers due to catastrophic forgetting on small models.
 |------|--------|------|---------|
 | — | `00_serve_model.py` | [vLLM](https://github.com/vllm-project/vllm) | Serve models (teacher for extraction, small for RAG) |
 | 1 | `01_extract_knowledge.py` | [OpenAI API](https://github.com/openai/openai-python) + [SDG Hub](https://github.com/instructlab/sdg) | 3-phase knowledge extraction from teacher model |
-| 2 | `02_build_vectorstore.py` | [sentence-transformers](https://github.com/UKPLab/sentence-transformers) + [FAISS](https://github.com/facebookresearch/faiss) | Embed and index knowledge in a vector store |
-| 3 | `03_query_rag.py` | FAISS + OpenAI API | RAG-augmented queries against a small model |
-| 4 | `04_evaluate_rag.py` | FAISS + OpenAI API + [rouge-score](https://github.com/google-research/google-research/tree/master/rouge) | Evaluate RAG quality using SDG QA pairs |
+| 2 | `02_build_vectorstore.py` | [sentence-transformers](https://github.com/UKPLab/sentence-transformers) + [FAISS](https://github.com/facebookresearch/faiss) + [BM25](https://github.com/dorianbrown/rank_bm25) | Build hybrid vector store (dense + sparse) |
+| 3 | `03_query_rag.py` | FAISS + BM25 + [cross-encoder](https://www.sbert.net/docs/cross_encoder/usage/usage.html) + OpenAI API | Hybrid retrieval, reranking, and RAG queries |
+| 4 | `04_evaluate_rag.py` | FAISS + BM25 + cross-encoder + OpenAI API + [rouge-score](https://github.com/google-research/google-research/tree/master/rouge) | Evaluate RAG quality using SDG QA pairs |
 
 ## How It Works
 
@@ -28,11 +28,21 @@ answers due to catastrophic forgetting on small models.
 3. **SDG Expansion** — Each seed document is fed through an SDG Hub flow
    to produce structured QA pairs
 
-### Steps 2–4: RAG Pipeline
+### Steps 2–4: Hybrid RAG Pipeline
 
-The seed documents and QA pairs are chunked, embedded, and stored in a
-FAISS vector store. At query time, the most relevant chunks are
-retrieved and injected into the small model's prompt as context.
+The seed documents and QA pairs are chunked (with context prefixes for
+self-containedness), embedded with a BGE model, and stored in both a
+FAISS index (dense retrieval) and a BM25 index (sparse keyword
+retrieval). At query time:
+
+1. **Hybrid retrieval** — candidates are fetched from both indexes and
+   fused using reciprocal rank fusion (RRF)
+2. **Cross-encoder reranking** — a cross-encoder model rescores the
+   candidates for precision
+3. **Relevance threshold** — chunks below a configurable score are
+   dropped; if no chunks pass, the model falls back to its own knowledge
+4. **Improved RAG prompt** — the system prompt instructs the model to
+   ignore irrelevant context rather than forcing it into the answer
 
 ## Target Environment
 
@@ -154,7 +164,7 @@ python3.12 01_extract_knowledge.py \
   --url http://localhost:8000/v1 --token dummy \
   --domain "Infrastructure" \
   --topic "OpenShift Virtualization Networking" \
-  --num-subtopics 20 \
+  --num-subtopics 40 \
   --resume --background
 
 # Monitor progress
@@ -250,7 +260,7 @@ Key Facts) to produce structured QA pairs. Output is saved to
 | `--token` | Yes | | API key / bearer token |
 | `--topic` | Yes | | Topic to extract knowledge about |
 | `--domain` | No | `General` | Knowledge domain label |
-| `--num-subtopics` | No | `20` | Number of subtopics to generate |
+| `--num-subtopics` | No | `40` | Number of subtopics to generate |
 | `--output-dir` | No | `./knowledge` | Directory for output artifacts |
 | `--flow` | No | `Key Facts Knowledge Tuning Dataset Generation Flow` | SDG Hub flow name |
 | `--max-concurrency` | No | `4` | Max concurrent LLM requests |
@@ -273,7 +283,7 @@ python3.12 01_extract_knowledge.py \
   --url http://localhost:8000/v1 --token dummy \
   --domain "Infrastructure" \
   --topic "OpenShift Virtualization Networking" \
-  --num-subtopics 20 \
+  --num-subtopics 40 \
   --resume --background
 
 # Run only topic decomposition
@@ -291,11 +301,12 @@ python3.12 01_extract_knowledge.py --status
 > `--resume`, completed phases are skipped. Within Phases 2 and 3,
 > batch checkpointing allows recovery from failures.
 
-## Step 2: Build the Vector Store
+## Step 2: Build the Hybrid Vector Store
 
-`02_build_vectorstore.py` chunks the seed documents, combines them with
-the SDG QA pairs, generates embeddings with sentence-transformers, and
-builds a FAISS index.
+`02_build_vectorstore.py` chunks the seed documents (with context
+prefixes for self-containedness), combines them with the SDG QA pairs,
+generates embeddings with a BGE model, and builds both a FAISS index
+(dense retrieval) and a BM25 index (sparse keyword retrieval).
 
 ### Arguments
 
@@ -303,25 +314,34 @@ builds a FAISS index.
 |----------|----------|---------|-------------|
 | `--knowledge-dir` | No | `./knowledge` | Directory containing `seed_docs.json` and `knowledge.csv` |
 | `--output` | No | `./vectorstore` | Output directory for the vector store |
-| `--embedding-model` | No | `sentence-transformers/all-MiniLM-L6-v2` | Sentence-transformers model |
-| `--max-chunk-chars` | No | `2500` | Max characters per chunk |
+| `--embedding-model` | No | `BAAI/bge-base-en-v1.5` | Sentence-transformers model (768d BGE) |
+| `--max-chunk-chars` | No | `2000` | Max characters per chunk |
 | `--batch-size` | No | `64` | Embedding batch size |
+| `--no-bm25` | No | | Skip BM25 index creation (dense-only mode) |
 
 ### Examples
 
 ```bash
-# Build with defaults
+# Build with defaults (BGE embeddings + BM25)
 python3.12 02_build_vectorstore.py
+
+# Dense-only mode (no BM25)
+python3.12 02_build_vectorstore.py --no-bm25
 
 # Use a different embedding model
 python3.12 02_build_vectorstore.py \
-  --embedding-model "nomic-ai/nomic-embed-text-v1.5"
+  --embedding-model "sentence-transformers/all-mpnet-base-v2"
 ```
 
 ## Step 3: Query with RAG
 
-`03_query_rag.py` retrieves relevant context from the vector store and
-queries the small model with an augmented prompt.
+`03_query_rag.py` retrieves relevant context from the hybrid vector
+store using dense + BM25 retrieval with reciprocal rank fusion (RRF),
+optionally reranks with a cross-encoder, applies a relevance score
+threshold, and queries the small model with an augmented prompt.
+
+If all chunks fall below the relevance threshold, the model falls back
+to answering from its own knowledge (no context injected).
 
 Use `--no-context` to also query the model without RAG and see both
 answers side by side.
@@ -336,33 +356,48 @@ answers side by side.
 | `--token` | Yes | | API key |
 | `--question` | Yes | | Question to ask |
 | `--system-prompt` | No | `You are a helpful technical assistant.` | System prompt |
-| `--top-k` | No | `5` | Number of chunks to retrieve |
-| `--max-new-tokens` | No | `512` | Max tokens to generate |
+| `--top-k` | No | `5` | Number of final chunks to use as context |
+| `--top-k-initial` | No | `20` | Candidates to retrieve before reranking |
+| `--max-new-tokens` | No | `1024` | Max tokens to generate |
 | `--no-context` | No | | Also query without RAG for comparison |
+| `--reranker` | No | `cross-encoder/ms-marco-MiniLM-L-6-v2` | Cross-encoder model for reranking |
+| `--no-reranker` | No | | Disable cross-encoder reranking |
+| `--min-score` | No | `0.0` | Minimum relevance score; chunks below are dropped |
 
 ### Examples
 
 ```bash
-# Simple RAG query
+# Simple RAG query (hybrid retrieval + reranking)
 python3.12 03_query_rag.py \
   --model "hosted_vllm/ibm-granite/granite-3.3-2b-instruct" \
   --url http://localhost:8000/v1 --token dummy \
   --question "How do I expose a VM with a Kubernetes service?"
 
-# Side-by-side comparison (with and without RAG)
+# Side-by-side comparison with relevance threshold
 python3.12 03_query_rag.py \
   --model "hosted_vllm/ibm-granite/granite-3.3-2b-instruct" \
   --url http://localhost:8000/v1 --token dummy \
   --question "What is the difference between masquerade and bridge networking?" \
   --system-prompt "You are an expert in OpenShift Virtualization networking." \
+  --min-score 1.0 \
   --no-context
+
+# Without reranking (faster, less accurate)
+python3.12 03_query_rag.py \
+  --model "hosted_vllm/ibm-granite/granite-3.3-2b-instruct" \
+  --url http://localhost:8000/v1 --token dummy \
+  --question "How do I configure SR-IOV for a VM?" \
+  --no-reranker
 ```
 
 ## Step 4: Evaluate RAG Quality
 
 `04_evaluate_rag.py` runs each question from `knowledge.csv` through the
-RAG pipeline and compares the answer against the reference using ROUGE-L
-and token-level F1.
+full hybrid RAG pipeline (retrieval, reranking, threshold) and compares
+the answer against the reference using ROUGE-L and token-level F1.
+
+The summary includes how many questions used retrieved context vs. fell
+back to no-context mode due to the relevance threshold.
 
 ### Arguments
 
@@ -374,11 +409,15 @@ and token-level F1.
 | `--url` | Yes | | API base URL |
 | `--token` | Yes | | API key |
 | `--system-prompt` | No | `You are a helpful technical assistant.` | System prompt |
-| `--top-k` | No | `5` | Number of chunks to retrieve |
-| `--max-new-tokens` | No | `512` | Max tokens to generate |
+| `--top-k` | No | `5` | Number of final chunks to use as context |
+| `--top-k-initial` | No | `20` | Candidates to retrieve before reranking |
+| `--max-new-tokens` | No | `1024` | Max tokens to generate |
 | `--output` | No | `evaluation_results.csv` | Output CSV path |
 | `--sample-size` | No | | Evaluate a random subset of N questions |
 | `--with-baseline` | No | | Also query without RAG for comparison |
+| `--reranker` | No | `cross-encoder/ms-marco-MiniLM-L-6-v2` | Cross-encoder model for reranking |
+| `--no-reranker` | No | | Disable cross-encoder reranking |
+| `--min-score` | No | `0.0` | Minimum relevance score threshold |
 | `--background` | No | | Run in background |
 | `--status` | No | | Show status |
 | `--stop` | No | | Stop background process |
@@ -386,17 +425,23 @@ and token-level F1.
 ### Examples
 
 ```bash
-# Full evaluation with baseline comparison
+# Full evaluation with baseline comparison and reranking
 python3.12 04_evaluate_rag.py \
   --model "hosted_vllm/ibm-granite/granite-3.3-2b-instruct" \
   --url http://localhost:8000/v1 --token dummy \
   --with-baseline --background
 
-# Quick evaluation on a subset
+# Quick evaluation with relevance threshold
 python3.12 04_evaluate_rag.py \
   --model "hosted_vllm/ibm-granite/granite-3.3-2b-instruct" \
   --url http://localhost:8000/v1 --token dummy \
-  --sample-size 20
+  --sample-size 20 --min-score 1.0
+
+# Evaluation without reranking (faster)
+python3.12 04_evaluate_rag.py \
+  --model "hosted_vllm/ibm-granite/granite-3.3-2b-instruct" \
+  --url http://localhost:8000/v1 --token dummy \
+  --no-reranker --sample-size 50
 ```
 
 ## Managing the Container
@@ -452,10 +497,10 @@ podman exec -it sdg-rag-container /bin/bash
 ```
 00_serve_model.py          # Serve models via vLLM (reused from finetune pipeline)
 01_extract_knowledge.py    # Step 1 — 3-phase knowledge extraction from teacher model
-02_build_vectorstore.py    # Step 2 — embed + build FAISS index
-03_query_rag.py            # Step 3 — RAG-augmented queries
+02_build_vectorstore.py    # Step 2 — build hybrid vector store (FAISS + BM25)
+03_query_rag.py            # Step 3 — hybrid retrieval, reranking, RAG queries
 04_evaluate_rag.py         # Step 4 — batch evaluation with metrics
-Containerfile              # UBI9 container image with pipeline dependencies
+Containerfile              # RHEL AI vLLM container image with pipeline dependencies
 README.md
 example-projects/          # Previous finetune pipeline (reference)
 ```

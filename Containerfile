@@ -16,7 +16,8 @@ RUN pip3.12 install --no-cache-dir \
         sentence-transformers \
         faiss-cpu \
         rouge-score \
-        openai
+        openai \
+        rank_bm25
 
 # The base image sets HF offline mode; allow model downloads.
 ENV HF_HUB_OFFLINE=0

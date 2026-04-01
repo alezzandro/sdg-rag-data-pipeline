@@ -57,17 +57,35 @@ DECOMPOSE_PROMPT = """\
 You are a domain expert in {domain}.
 
 Break the topic "{topic}" into exactly {num_subtopics} subtopics that \
-together provide comprehensive coverage. Each subtopic should be specific \
-enough for a standalone technical article of 1000-2000 words.
+together provide comprehensive coverage.
+
+CRITICAL REQUIREMENTS for each subtopic:
+- Each subtopic MUST be narrow and specific — something a practitioner \
+would search for as a concrete how-to or reference question.
+- AVOID broad/generic titles like "Overview of X" or "Introduction to Y" \
+or "Advanced Concepts in Z". Instead, use titles that describe a specific \
+task, configuration, or scenario.
+- Good example: "Configuring a Secondary NIC with Multus and \
+NetworkAttachmentDefinition"
+- Bad example: "Networking Concepts in OpenShift Virtualization"
+- Each subtopic should be specific enough for a standalone technical \
+article of 1000-2000 words with concrete examples, YAML snippets, CLI \
+commands, or API references.
+- Ensure the subtopics cover BOTH common tasks AND edge cases / \
+troubleshooting scenarios.
 
 Return ONLY a JSON array (no markdown fences, no commentary) where each \
 element is an object with two keys:
-  "title"       — concise subtopic title
-  "description" — 1-2 sentence scope description
+  "title"       — specific, actionable subtopic title
+  "description" — 1-2 sentence scope description including concrete \
+items to cover (specific resources, commands, config fields)
 
 Example format:
 [
-  {{"title": "Example Subtopic", "description": "Covers X, Y, and Z."}}
+  {{"title": "Configuring SR-IOV Virtual Functions for VM Passthrough", \
+"description": "Covers creating SriovNetworkNodePolicy, allocating VFs, \
+attaching them to VMs via spec.domain.devices.interfaces, and verifying \
+passthrough with lspci inside the guest."}}
 ]
 """
 
@@ -112,8 +130,15 @@ Write a comprehensive, detailed technical article about the following subtopic:
 
 Requirements:
 - Write 1000-2000 words of factual, detailed content
-- Use markdown formatting with headings, bullet points, and code blocks where appropriate
-- Include specific configuration examples, commands, or API references when relevant
+- Use markdown formatting with headings (## and ###), bullet points, and \
+code blocks
+- MUST include at least 3 concrete examples: complete YAML manifests, CLI \
+commands with expected output, or API calls with request/response bodies
+- Each section heading should be a specific, searchable phrase \
+(e.g. "## Creating a NetworkAttachmentDefinition for bridge CNI" rather \
+than "## Configuration")
+- Include prerequisite checks, common errors and their solutions, and \
+verification steps for each procedure
 - Write as an authoritative reference, not a tutorial
 - Do not include a title heading (the title is already known)
 """
@@ -302,8 +327,8 @@ def main():
                         help="Knowledge domain (default: General)")
     parser.add_argument("--topic", type=str,
                         help="Topic to extract knowledge about")
-    parser.add_argument("--num-subtopics", type=int, default=20,
-                        help="Number of subtopics to generate (default: 20)")
+    parser.add_argument("--num-subtopics", type=int, default=40,
+                        help="Number of subtopics to generate (default: 40)")
     parser.add_argument("--output-dir", type=str, default="./knowledge",
                         help="Directory for output artifacts (default: ./knowledge)")
     parser.add_argument("--flow", type=str,

@@ -1,16 +1,19 @@
 """Evaluate the RAG pipeline using SDG-generated QA pairs as ground truth.
 
-For each question in knowledge.csv, retrieves context from the vector store,
-queries the small model, and compares the RAG answer against the reference
-answer using ROUGE-L and token-level F1.
+For each question in knowledge.csv, retrieves context from the hybrid vector
+store (FAISS + BM25 with RRF), optionally reranks with a cross-encoder,
+applies a relevance threshold, queries the small model, and compares the
+RAG answer against the reference answer using ROUGE-L and token-level F1.
 
 Optionally queries the model without RAG context (--with-baseline) to
 measure the improvement from retrieval augmentation.
 """
 
 import os
+import re
 import sys
 import json
+import pickle
 import signal
 import argparse
 import subprocess
@@ -21,13 +24,18 @@ from collections import Counter
 import numpy as np
 import pandas as pd
 import faiss
-from sentence_transformers import SentenceTransformer
+from sentence_transformers import SentenceTransformer, CrossEncoder
 from openai import OpenAI
 
 try:
     from rouge_score import rouge_scorer
 except ImportError:
     rouge_scorer = None
+
+try:
+    from rank_bm25 import BM25Okapi
+except ImportError:
+    BM25Okapi = None
 
 LOGFILE = "evaluate_rag.log"
 PIDFILE = "evaluate_rag.pid"
@@ -36,39 +44,130 @@ PIDFILE = "evaluate_rag.pid"
 RAG_SYSTEM_TEMPLATE = """\
 {system_prompt}
 
-Use the following reference material to answer the user's question. \
-If the reference material does not contain enough information, say so \
-and answer based on your general knowledge.
+You are given reference material below that MAY be relevant to the user's \
+question. Follow these rules strictly:
+
+1. If the reference material directly addresses the question, use it to \
+produce a detailed, accurate answer with specific examples.
+2. If the reference material is only tangentially related or does NOT \
+address the question, IGNORE it entirely and answer using your own \
+knowledge. Do NOT force irrelevant references into your answer.
+3. Never mention "the reference material" or "the provided context" in \
+your answer — write as if the knowledge is your own.
 
 --- REFERENCE MATERIAL ---
 {context}
 --- END REFERENCE MATERIAL ---"""
 
 
+# ---------------------------------------------------------------------------
+# Vector store loading + retrieval (shared logic with 03_query_rag.py)
+# ---------------------------------------------------------------------------
+
 def load_vectorstore(path):
-    """Load a FAISS index, metadata, and config from disk."""
+    """Load FAISS index, BM25 index (if available), metadata, and config."""
     with open(os.path.join(path, "config.json"), "r") as f:
         config = json.load(f)
     index = faiss.read_index(os.path.join(path, "index.faiss"))
     with open(os.path.join(path, "metadata.json"), "r") as f:
         metadata = json.load(f)
-    return index, metadata, config
+
+    bm25 = None
+    bm25_path = os.path.join(path, "bm25.pkl")
+    if config.get("has_bm25") and os.path.exists(bm25_path):
+        with open(bm25_path, "rb") as f:
+            bm25 = pickle.load(f)
+
+    return index, metadata, config, bm25
 
 
-def retrieve(index, metadata, query_embedding, top_k=5):
-    """Retrieve top-k chunks from the FAISS index."""
+def tokenize_for_bm25(text):
+    return re.findall(r"\w+", text.lower())
+
+
+def retrieve_hybrid(index, metadata, bm25, query_embedding, query_text,
+                    top_k=5, top_k_initial=20, rrf_k=60):
+    fetch_k = max(top_k_initial, top_k * 4)
+
+    query_vec = np.array([query_embedding], dtype=np.float32)
+    dense_scores, dense_indices = index.search(query_vec, fetch_k)
+
+    dense_ranks = {}
+    for rank, idx in enumerate(dense_indices[0]):
+        if idx >= 0:
+            dense_ranks[int(idx)] = rank + 1
+
+    sparse_ranks = {}
+    if bm25 is not None:
+        tokens = tokenize_for_bm25(query_text)
+        bm25_scores = bm25.get_scores(tokens)
+        top_sparse_indices = np.argsort(bm25_scores)[::-1][:fetch_k]
+        for rank, idx in enumerate(top_sparse_indices):
+            if bm25_scores[idx] > 0:
+                sparse_ranks[int(idx)] = rank + 1
+
+    all_indices = set(dense_ranks.keys()) | set(sparse_ranks.keys())
+
+    rrf_scores = []
+    for idx in all_indices:
+        score = 0.0
+        if idx in dense_ranks:
+            score += 1.0 / (rrf_k + dense_ranks[idx])
+        if idx in sparse_ranks:
+            score += 1.0 / (rrf_k + sparse_ranks[idx])
+        dense_score = float(dense_scores[0][list(dense_indices[0]).index(idx)]) if idx in dense_ranks else 0.0
+        rrf_scores.append((idx, score, dense_score))
+
+    rrf_scores.sort(key=lambda x: x[1], reverse=True)
+
+    results = []
+    for idx, rrf_score, dense_score in rrf_scores[:top_k_initial]:
+        results.append({
+            "text": metadata[idx]["text"],
+            "score": dense_score,
+            "rrf_score": rrf_score,
+        })
+    return results
+
+
+def retrieve_dense_only(index, metadata, query_embedding, top_k=20):
     query_vec = np.array([query_embedding], dtype=np.float32)
     scores, indices = index.search(query_vec, top_k)
     results = []
     for score, idx in zip(scores[0], indices[0]):
         if idx < 0:
             continue
-        results.append({"text": metadata[idx]["text"], "score": float(score)})
+        results.append({
+            "text": metadata[idx]["text"],
+            "score": float(score),
+            "rrf_score": float(score),
+        })
     return results
 
 
-def query_model(client, model, messages, max_tokens=512):
-    """Send a chat completion request."""
+def rerank(results, query, reranker_model, top_k=5):
+    if not results:
+        return results
+    pairs = [(query, r["text"]) for r in results]
+    scores = reranker_model.predict(pairs)
+    for i, score in enumerate(scores):
+        results[i]["rerank_score"] = float(score)
+    results.sort(key=lambda x: x["rerank_score"], reverse=True)
+    return results[:top_k]
+
+
+def apply_threshold(results, min_score):
+    if min_score <= 0 or not results:
+        return results
+    score_key = "rerank_score" if "rerank_score" in results[0] else "score"
+    return [r for r in results if r.get(score_key, 0) >= min_score]
+
+
+# ---------------------------------------------------------------------------
+# Metrics
+# ---------------------------------------------------------------------------
+
+def query_model(client, model, messages, max_tokens=1024):
     resp = client.chat.completions.create(
         model=model,
         messages=messages,
@@ -79,7 +178,6 @@ def query_model(client, model, messages, max_tokens=512):
 
 
 def token_f1(prediction, reference):
-    """Compute token-level F1 between prediction and reference strings."""
     pred_tokens = prediction.lower().split()
     ref_tokens = reference.lower().split()
     if not pred_tokens or not ref_tokens:
@@ -94,7 +192,6 @@ def token_f1(prediction, reference):
 
 
 def compute_rouge_l(prediction, reference):
-    """Compute ROUGE-L F1 score."""
     if rouge_scorer is None:
         return None
     scorer = rouge_scorer.RougeScorer(["rougeL"], use_stemmer=True)
@@ -172,6 +269,10 @@ def _cleanup_pidfile():
         os.remove(PIDFILE)
 
 
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
+
 def main():
     parser = argparse.ArgumentParser(
         description="Evaluate RAG pipeline using SDG QA pairs as ground truth."
@@ -190,15 +291,24 @@ def main():
                         default="You are a helpful technical assistant.",
                         help="System prompt for the model")
     parser.add_argument("--top-k", type=int, default=5,
-                        help="Number of chunks to retrieve (default: 5)")
-    parser.add_argument("--max-new-tokens", type=int, default=512,
-                        help="Max tokens to generate (default: 512)")
+                        help="Number of final chunks to use as context (default: 5)")
+    parser.add_argument("--top-k-initial", type=int, default=20,
+                        help="Number of candidates to retrieve before reranking (default: 20)")
+    parser.add_argument("--max-new-tokens", type=int, default=1024,
+                        help="Max tokens to generate (default: 1024)")
     parser.add_argument("--output", type=str, default="evaluation_results.csv",
                         help="Output CSV path (default: evaluation_results.csv)")
     parser.add_argument("--sample-size", type=int, default=None,
                         help="Evaluate a random subset of N questions")
     parser.add_argument("--with-baseline", action="store_true",
                         help="Also query without RAG for baseline comparison")
+    parser.add_argument("--reranker", type=str,
+                        default="cross-encoder/ms-marco-MiniLM-L-6-v2",
+                        help="Cross-encoder model for reranking (default: cross-encoder/ms-marco-MiniLM-L-6-v2)")
+    parser.add_argument("--no-reranker", action="store_true",
+                        help="Disable cross-encoder reranking")
+    parser.add_argument("--min-score", type=float, default=0.0,
+                        help="Minimum relevance score threshold (default: 0.0 = no threshold)")
     parser.add_argument("--background", action="store_true",
                         help="Run in background")
     parser.add_argument("--status", action="store_true",
@@ -272,13 +382,21 @@ def main():
 
     # --- Load vector store ---
     print(f"Loading vector store from {args.vectorstore}/")
-    index, metadata, config = load_vectorstore(args.vectorstore)
+    index, metadata, config, bm25 = load_vectorstore(args.vectorstore)
     print(f"  {config['num_vectors']} vectors ({config['embedding_model']})")
+    if bm25 is not None:
+        print(f"  BM25 index loaded (hybrid retrieval enabled)")
 
     print(f"Loading embedding model: {config['embedding_model']}")
     embed_model = SentenceTransformer(config["embedding_model"])
+    query_instruction = config.get("query_instruction", "")
 
-    # Strip hosted_vllm/ prefix for OpenAI client
+    # --- Load reranker ---
+    reranker_model = None
+    if not args.no_reranker:
+        print(f"Loading reranker: {args.reranker}")
+        reranker_model = CrossEncoder(args.reranker)
+
     api_model = args.model
     if api_model.startswith("hosted_vllm/"):
         api_model = api_model[len("hosted_vllm/"):]
@@ -286,24 +404,47 @@ def main():
 
     # --- Evaluate ---
     results = []
+    context_used_count = 0
+    context_skipped_count = 0
+
     for i, (question, reference) in enumerate(qa_pairs, 1):
         question = str(question).strip()
         reference = str(reference).strip()
 
         print(f"\n[{i}/{len(qa_pairs)}] {question[:80]}...")
 
-        # Embed and retrieve
-        q_embedding = embed_model.encode(question, normalize_embeddings=True)
-        chunks = retrieve(index, metadata, q_embedding, top_k=args.top_k)
-        context_block = "\n\n".join(
-            f"[{j+1}] {c['text']}" for j, c in enumerate(chunks)
-        )
+        embed_input = query_instruction + question if query_instruction else question
+        q_embedding = embed_model.encode(embed_input, normalize_embeddings=True)
 
-        # RAG query
-        rag_system = RAG_SYSTEM_TEMPLATE.format(
-            system_prompt=args.system_prompt,
-            context=context_block,
-        )
+        if bm25 is not None:
+            chunks = retrieve_hybrid(
+                index, metadata, bm25, q_embedding, question,
+                top_k=args.top_k, top_k_initial=args.top_k_initial,
+            )
+        else:
+            chunks = retrieve_dense_only(index, metadata, q_embedding, top_k=args.top_k_initial)
+
+        if reranker_model is not None and chunks:
+            chunks = rerank(chunks, question, reranker_model, top_k=args.top_k)
+        else:
+            chunks = chunks[:args.top_k]
+
+        if args.min_score > 0 and chunks:
+            chunks = apply_threshold(chunks, args.min_score)
+
+        if chunks:
+            context_used_count += 1
+            context_block = "\n\n".join(
+                f"[{j+1}] {c['text']}" for j, c in enumerate(chunks)
+            )
+            rag_system = RAG_SYSTEM_TEMPLATE.format(
+                system_prompt=args.system_prompt,
+                context=context_block,
+            )
+        else:
+            context_skipped_count += 1
+            rag_system = args.system_prompt
+
         rag_messages = [
             {"role": "system", "content": rag_system},
             {"role": "user", "content": question},
@@ -321,9 +462,9 @@ def main():
             "rag_token_f1": token_f1(rag_answer, reference),
             "rag_rouge_l": compute_rouge_l(rag_answer, reference),
             "top_chunk_score": chunks[0]["score"] if chunks else 0.0,
+            "context_used": bool(chunks),
         }
 
-        # Baseline (no RAG) query
         if args.with_baseline:
             bare_messages = [
                 {"role": "system", "content": args.system_prompt},
@@ -340,7 +481,8 @@ def main():
             row["baseline_rouge_l"] = compute_rouge_l(bare_answer, reference)
 
         results.append(row)
-        print(f"  RAG F1={row['rag_token_f1']:.3f}  ROUGE-L={row.get('rag_rouge_l', 'N/A')}")
+        print(f"  RAG F1={row['rag_token_f1']:.3f}  ROUGE-L={row.get('rag_rouge_l', 'N/A')}"
+              f"  context={'yes' if row['context_used'] else 'NO (below threshold)'}")
         if args.with_baseline:
             print(f"  Base F1={row['baseline_token_f1']:.3f}  "
                   f"ROUGE-L={row.get('baseline_rouge_l', 'N/A')}")
@@ -357,16 +499,18 @@ def main():
     print(f"\n{'='*60}")
     print("EVALUATION SUMMARY")
     print(f"{'='*60}")
-    print(f"  Questions evaluated:  {len(results)}")
-    print(f"  RAG Token F1 (avg):   {results_df['rag_token_f1'].mean():.4f}")
+    print(f"  Questions evaluated:      {len(results)}")
+    print(f"  Context used:             {context_used_count}")
+    print(f"  Context skipped (thresh): {context_skipped_count}")
+    print(f"  RAG Token F1 (avg):       {results_df['rag_token_f1'].mean():.4f}")
     if "rag_rouge_l" in results_df.columns and results_df["rag_rouge_l"].notna().any():
-        print(f"  RAG ROUGE-L (avg):    {results_df['rag_rouge_l'].mean():.4f}")
+        print(f"  RAG ROUGE-L (avg):        {results_df['rag_rouge_l'].mean():.4f}")
     if args.with_baseline:
-        print(f"  Baseline Token F1:    {results_df['baseline_token_f1'].mean():.4f}")
+        print(f"  Baseline Token F1:        {results_df['baseline_token_f1'].mean():.4f}")
         if "baseline_rouge_l" in results_df.columns and results_df["baseline_rouge_l"].notna().any():
-            print(f"  Baseline ROUGE-L:     {results_df['baseline_rouge_l'].mean():.4f}")
+            print(f"  Baseline ROUGE-L:         {results_df['baseline_rouge_l'].mean():.4f}")
         improvement = results_df["rag_token_f1"].mean() - results_df["baseline_token_f1"].mean()
-        print(f"  RAG improvement (F1): {improvement:+.4f}")
+        print(f"  RAG improvement (F1):     {improvement:+.4f}")
     print(f"{'='*60}")
 
     _cleanup_pidfile()
